@@ -100,11 +100,14 @@ type NewHasherArgs struct {
 	// least MaximumMemoryKiB. Zero or negative uses GOMAXPROCS, at most 4: a
 	// container may have many processors and little memory.
 	ConcurrentHashes int
-	// MaximumMemoryKiB and MaximumPasses bound what a stored hash may ask
-	// for in Matches. Zero uses the defaults, or Parameters' own when they
-	// are larger.
+	// MaximumMemoryKiB is the most memory, in KiB, a stored hash may ask
+	// for in Matches. Zero uses DefaultMaximumMemoryKiB, or
+	// Parameters.MemoryKiB when that is larger.
 	MaximumMemoryKiB uint32
-	MaximumPasses    uint32
+	// MaximumPasses is the most passes a stored hash may ask for in
+	// Matches. Zero uses DefaultMaximumPasses, or Parameters.Passes when
+	// that is larger.
+	MaximumPasses uint32
 	// Wait is how long a hash waits for memory before ErrBusy. Zero or
 	// negative uses DefaultWait.
 	Wait time.Duration
@@ -145,13 +148,20 @@ func NewHasher(args *NewHasherArgs) (*Hasher, error) {
 	case parameters.SaltBytes < minimumSaltBytes || parameters.SaltBytes > maximumSaltBytes:
 		return nil, fmt.Errorf("salt must be %d to %d bytes", minimumSaltBytes, maximumSaltBytes)
 	case parameters.DigestBytes < minimumDigestBytes || parameters.DigestBytes > maximumDigestBytes:
-		return nil, fmt.Errorf("digest must be %d to %d bytes", minimumDigestBytes, maximumDigestBytes)
+		return nil, fmt.Errorf(
+			"digest must be %d to %d bytes",
+			minimumDigestBytes,
+			maximumDigestBytes,
+		)
 	}
 	concurrentHashes := args.ConcurrentHashes
 	if concurrentHashes <= 0 {
 		concurrentHashes = min(max(runtime.GOMAXPROCS(0), 1), 4)
 	}
-	budgetKiB := max(int64(concurrentHashes)*int64(parameters.MemoryKiB), int64(maximumMemoryKiB))
+	memoryLimitKiB := max(
+		int64(concurrentHashes)*int64(parameters.MemoryKiB),
+		int64(maximumMemoryKiB),
+	)
 	wait := args.Wait
 	if wait <= 0 {
 		wait = DefaultWait
@@ -160,7 +170,7 @@ func NewHasher(args *NewHasherArgs) (*Hasher, error) {
 		parameters:       parameters,
 		maximumMemoryKiB: maximumMemoryKiB,
 		maximumPasses:    maximumPasses,
-		memory:           semaphore.NewWeighted(budgetKiB),
+		memory:           semaphore.NewWeighted(memoryLimitKiB),
 		wait:             wait,
 	}, nil
 }
@@ -212,7 +222,8 @@ func (h *Hasher) Matches(ctx context.Context, encoded string, password string) (
 	if err != nil {
 		return false, err
 	}
-	if stored.parameters.MemoryKiB > h.maximumMemoryKiB || stored.parameters.Passes > h.maximumPasses {
+	if stored.parameters.MemoryKiB > h.maximumMemoryKiB ||
+		stored.parameters.Passes > h.maximumPasses {
 		return false, fmt.Errorf("%w: it asks for more than this hasher allows", ErrEncoding)
 	}
 	if len(password) > MaximumLength {
@@ -273,7 +284,8 @@ func decode(encoded string) (storedHash, error) {
 	var trailing string
 	scanned, _ := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d%s",
 		&parameters.MemoryKiB, &parameters.Passes, &parameters.Lanes, &trailing)
-	if scanned != 3 || parameters.MemoryKiB == 0 || parameters.Passes == 0 || parameters.Lanes == 0 ||
+	if scanned != 3 || parameters.MemoryKiB == 0 || parameters.Passes == 0 ||
+		parameters.Lanes == 0 ||
 		parameters.MemoryKiB < 8*uint32(parameters.Lanes) {
 		return storedHash{}, ErrEncoding
 	}

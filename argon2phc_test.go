@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -39,23 +40,27 @@ func TestHash(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(encoded, "$argon2id$v=19$m=65536,t=3,p=2$") {
-		t.Fatalf("encoded %s", encoded)
+		t.Fatalf("encoded = %s, want the prefix $argon2id$v=19$m=65536,t=3,p=2$", encoded)
 	}
-	if matched, err := hasher.Matches(t.Context(), encoded, password); err != nil || !matched {
-		t.Fatalf("the password does not match: %v", err)
+	matched, err := hasher.Matches(t.Context(), encoded, password)
+	if err != nil || !matched {
+		t.Fatalf("Matches(the password) = %v, %v, want true", matched, err)
 	}
-	if matched, _ := hasher.Matches(t.Context(), encoded, password+"!"); matched {
-		t.Fatal("another password matches")
+	matched, err = hasher.Matches(t.Context(), encoded, password+"!")
+	if err != nil || matched {
+		t.Fatalf("Matches(another password) = %v, %v, want false", matched, err)
 	}
 	again, err := hasher.Hash(t.Context(), password)
 	if err != nil || again == encoded {
-		t.Fatalf("two hashes share a salt: %v", err)
+		t.Fatalf("two hashes share a salt: %v, want distinct salts", err)
 	}
-	if _, err := hasher.Hash(t.Context(), strings.Repeat("a", MaximumLength+1)); !errors.Is(err, ErrTooLong) {
-		t.Fatalf("a long password: %v", err)
+	tooLong := strings.Repeat("a", MaximumLength+1)
+	if _, err := hasher.Hash(t.Context(), tooLong); !errors.Is(err, ErrTooLong) {
+		t.Fatalf("Hash(a long password) = %v, want ErrTooLong", err)
 	}
-	if matched, err := hasher.Matches(t.Context(), encoded, strings.Repeat("a", MaximumLength+1)); matched || err != nil {
-		t.Fatalf("a long password matched %v, %v", matched, err)
+	matched, err = hasher.Matches(t.Context(), encoded, tooLong)
+	if matched || err != nil {
+		t.Fatalf("Matches(a long password) = %v, %v, want false and no error", matched, err)
 	}
 }
 
@@ -78,7 +83,7 @@ func TestMatchesRefusesUnreadableHashes(t *testing.T) {
 		"x$argon2id$v=19$m=64,t=1,p=1$" + salt22 + "$" + digest43,
 	} {
 		if _, err := hasher.Matches(t.Context(), broken, "password"); !errors.Is(err, ErrEncoding) {
-			t.Errorf("%q: %v", broken, err)
+			t.Errorf("Matches(%q) = %v, want ErrEncoding", broken, err)
 		}
 	}
 }
@@ -103,45 +108,56 @@ func TestNeedsRehash(t *testing.T) {
 	if !strongerHasher.NeedsRehash(encoded) {
 		t.Fatal("a hash with fewer passes does not need rehashing")
 	}
-	if matched, err := strongerHasher.Matches(t.Context(), encoded, "password"); err != nil || !matched {
-		t.Fatalf("an older hash no longer matches: %v", err)
+	matched, err := strongerHasher.Matches(t.Context(), encoded, "password")
+	if err != nil || !matched {
+		t.Fatalf("Matches(an older hash) = %v, %v, want true", matched, err)
 	}
 	if !cheap.NeedsRehash("garbage") {
 		t.Fatal("an unreadable hash does not need rehashing")
 	}
 }
 
-// TestBusy checks that a hash gives up with ErrBusy when the memory budget
-// stays taken, and with the context's error when it is cancelled first.
+// TestBusy checks that a hash gives up with ErrBusy once it has waited the
+// whole Wait for memory that stays taken, and with the context's error when
+// it is cancelled first.
 func TestBusy(t *testing.T) {
-	hasher, err := NewHasher(&NewHasherArgs{
-		Parameters:       cheapParameters,
-		ConcurrentHashes: 1,
-		MaximumMemoryKiB: cheapParameters.MemoryKiB,
-		Wait:             10 * time.Millisecond,
+	synctest.Test(t, func(t *testing.T) {
+		hasher, err := NewHasher(&NewHasherArgs{
+			Parameters:       cheapParameters,
+			ConcurrentHashes: 1,
+			MaximumMemoryKiB: cheapParameters.MemoryKiB,
+			Wait:             10 * time.Second,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		release, err := hasher.reserveMemory(t.Context(), cheapParameters.MemoryKiB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		if _, err := hasher.Hash(t.Context(), "password"); !errors.Is(err, ErrBusy) {
+			t.Fatalf("Hash with the memory taken = %v, want ErrBusy", err)
+		}
+		if waited := time.Since(started); waited != 10*time.Second {
+			t.Fatalf("Hash gave up after %s, want 10s, the Wait", waited)
+		}
+		cancelled, cancel := context.WithCancel(t.Context())
+		cancel()
+		if _, err := hasher.Hash(cancelled, "password"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Hash on a cancelled context = %v, want context.Canceled", err)
+		}
+		release()
+		if _, err := hasher.Hash(cancelled, "password"); !errors.Is(err, context.Canceled) {
+			t.Fatalf(
+				"Hash on a cancelled context with memory free = %v, want context.Canceled",
+				err,
+			)
+		}
+		if _, err := hasher.Hash(t.Context(), "password"); err != nil {
+			t.Fatalf("Hash after the memory was released = %v, want nil", err)
+		}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	release, err := hasher.reserveMemory(t.Context(), cheapParameters.MemoryKiB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := hasher.Hash(t.Context(), "password"); !errors.Is(err, ErrBusy) {
-		t.Fatalf("hash with the budget taken: %v", err)
-	}
-	cancelled, cancel := context.WithCancel(t.Context())
-	cancel()
-	if _, err := hasher.Hash(cancelled, "password"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("hash on a cancelled context: %v", err)
-	}
-	release()
-	if _, err := hasher.Hash(cancelled, "password"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("hash on a cancelled context with memory free: %v", err)
-	}
-	if _, err := hasher.Hash(t.Context(), "password"); err != nil {
-		t.Fatalf("hash after the memory was released: %v", err)
-	}
 }
 
 // TestNewHasherRefusesUnusableParameters checks parameter validation.
@@ -156,7 +172,7 @@ func TestNewHasherRefusesUnusableParameters(t *testing.T) {
 		{MemoryKiB: 1<<22 + 1, Passes: 1, Lanes: 1, SaltBytes: 16, DigestBytes: 32},
 	} {
 		if _, err := NewHasher(&NewHasherArgs{Parameters: parameters}); err == nil {
-			t.Errorf("%+v was accepted", parameters)
+			t.Errorf("NewHasher(%+v) returned no error, want one", parameters)
 		}
 	}
 }
@@ -164,7 +180,9 @@ func TestNewHasherRefusesUnusableParameters(t *testing.T) {
 // FuzzDecode checks that the parser never panics, that whatever it reads is
 // within the size bounds, and that encoding what it read reads back the same.
 func FuzzDecode(f *testing.F) {
-	f.Add("$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHRzb21lc2FsdA$ZGlnZXN0ZGlnZXN0ZGlnZXN0ZGlnZXN0ZGlnZXN0MTI")
+	f.Add(
+		"$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHRzb21lc2FsdA$ZGlnZXN0ZGlnZXN0ZGlnZXN0ZGlnZXN0ZGlnZXN0MTI",
+	)
 	f.Add("$argon2id$v=19$m=64,t=1,p=1$" + salt22 + "$" + digest43)
 	f.Fuzz(func(t *testing.T, encoded string) {
 		stored, err := decode(encoded)
@@ -176,7 +194,11 @@ func FuzzDecode(f *testing.F) {
 		}
 		again, err := decode(encode(stored.parameters, stored.salt, stored.digest))
 		if err != nil || again.parameters != stored.parameters ||
-			string(again.salt) != string(stored.salt) || string(again.digest) != string(stored.digest) {
+			string(
+				again.salt,
+			) != string(
+				stored.salt,
+			) || string(again.digest) != string(stored.digest) {
 			t.Fatalf("%q does not read back the same: %v", encoded, err)
 		}
 	})
@@ -203,7 +225,7 @@ func TestVerificationLimits(t *testing.T) {
 	}
 	greedy := "$argon2id$v=19$m=2097152,t=1,p=1$" + salt22 + "$" + digest43
 	if _, err := hasher.Matches(t.Context(), greedy, "password"); !errors.Is(err, ErrEncoding) {
-		t.Fatalf("a 2 GiB stored hash: %v", err)
+		t.Fatalf("Matches(a 2 GiB stored hash) = %v, want ErrEncoding", err)
 	}
 	if _, err := decode(greedy); err != nil {
 		t.Fatalf("the parser itself refused a well-formed hash: %v", err)
