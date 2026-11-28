@@ -33,4 +33,4 @@ if matched && hasher.NeedsRehash(encoded) {
   which bounds the work per request.
 - One default hash takes roughly 40 to 60 ms on a modern core, depending on the machine.
 
-Tested on the two newest Go releases. Licensed under the MIT license.
+Requires Go 1.27. Licensed under the MIT license.
